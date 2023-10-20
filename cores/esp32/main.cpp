@@ -20,7 +20,7 @@
 #ifdef ARDUINO_LOOP_STACK_SIZE
 #undef ARDUINO_LOOP_STACK_SIZE
 #endif
-#define ARDUINO_LOOP_STACK_SIZE 5120
+#define ARDUINO_LOOP_STACK_SIZE 6144
 
 TaskHandle_t loopTaskHandle = NULL;
 
