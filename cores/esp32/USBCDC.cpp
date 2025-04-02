@@ -28,6 +28,14 @@ esp_err_t arduino_usb_event_handler_register_with(esp_event_base_t event_base, i
 #define MAX_USB_CDC_DEVICES 2
 USBCDC *devices[MAX_USB_CDC_DEVICES] = {NULL, NULL};
 
+// Increase the CDC default buffer size for more reliability
+#ifndef CONFIG_TINYUSB_CDC_RX_BUFSIZE
+#define CONFIG_TINYUSB_CDC_RX_BUFSIZE 64
+#endif
+
+// Default Rx queue size - increased for better reliability
+#define CDC_DEFAULT_RX_QUEUE_SIZE 1024
+
 static uint16_t load_cdc_descriptor(uint8_t *dst, uint8_t *itf) {
   uint8_t str_index = tinyusb_add_string_descriptor("TinyUSB CDC");
   uint8_t descriptor[TUD_CDC_DESC_LEN] = {// Interface number, string index, EP notification address and size, EP data address (out, in) and size.
@@ -147,7 +155,8 @@ void USBCDC::begin(unsigned long baud) {
   }
   // if rx_queue was set before begin(), keep it
   if (!rx_queue) {
-    setRxBufferSize(256);  //default if not preset
+    // Increased from 256 to 1024 for better reliability with high-throughput operations
+    setRxBufferSize(CDC_DEFAULT_RX_QUEUE_SIZE);
   }
   devices[itf] = this;
 }
@@ -268,19 +277,51 @@ void USBCDC::_onLineCoding(uint32_t _bit_rate, uint8_t _stop_bits, uint8_t _pari
 
 void USBCDC::_onRX() {
   arduino_usb_cdc_event_data_t p;
-  uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE + 1];
-  uint32_t count = tud_cdc_n_read(itf, buf, CONFIG_TINYUSB_CDC_RX_BUFSIZE);
-  for (uint32_t i = 0; i < count; i++) {
-    if (rx_queue == NULL || !xQueueSend(rx_queue, buf + i, 10)) {
-      p.rx_overflow.dropped_bytes = count - i;
-      arduino_usb_event_post(ARDUINO_USB_CDC_EVENTS, ARDUINO_USB_CDC_RX_OVERFLOW_EVENT, &p, sizeof(arduino_usb_cdc_event_data_t), portMAX_DELAY);
-      log_e("CDC RX Overflow.");
-      count = i;
-      break;
+  
+  // Use a larger buffer to read more data at once
+  uint8_t buf[CONFIG_TINYUSB_CDC_RX_BUFSIZE * 2];
+  
+  // Read all available data in chunks to reduce event overhead
+  uint32_t total_read = 0;
+  uint32_t available_data = tud_cdc_n_available(itf);
+  uint32_t dropped_bytes = 0;
+  
+  while (available_data > 0) {
+    // Read up to buffer size
+    uint32_t to_read = (available_data > sizeof(buf)) ? sizeof(buf) : available_data;
+    uint32_t count = tud_cdc_n_read(itf, buf, to_read);
+    
+    if (count == 0) {
+      break; // No more data
     }
+    
+    total_read += count;
+    available_data -= count;
+    
+    // Process the received data - add to queue
+    for (uint32_t i = 0; i < count; i++) {
+      if (rx_queue == NULL || !xQueueSend(rx_queue, buf + i, 0)) {
+        // If queue is full, track dropped bytes
+        dropped_bytes += (count - i);
+        // Break, we can't store any more data
+        break;
+      }
+    }
+    
+    // Small yield to prevent watchdog from triggering
+    vTaskDelay(0);
   }
-  if (count) {
-    p.rx.len = count;
+  
+  // Report any dropped bytes
+  if (dropped_bytes > 0) {
+    p.rx_overflow.dropped_bytes = dropped_bytes;
+    arduino_usb_event_post(ARDUINO_USB_CDC_EVENTS, ARDUINO_USB_CDC_RX_OVERFLOW_EVENT, &p, sizeof(arduino_usb_cdc_event_data_t), portMAX_DELAY);
+    log_e("CDC RX Overflow: %d bytes dropped", dropped_bytes);
+  }
+  
+  // Report total read bytes
+  if (total_read > 0) {
+    p.rx.len = total_read;
     arduino_usb_event_post(ARDUINO_USB_CDC_EVENTS, ARDUINO_USB_CDC_RX_EVENT, &p, sizeof(arduino_usb_cdc_event_data_t), portMAX_DELAY);
   }
 }
