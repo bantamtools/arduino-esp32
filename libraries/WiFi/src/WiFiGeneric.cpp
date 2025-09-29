@@ -1032,7 +1032,7 @@ void WiFiGenericClass::removeEvent(wifi_event_id_t id)
  */
 esp_err_t WiFiGenericClass::_eventCallback(arduino_event_t *event)
 {
-    static bool first_connect = true;
+    static bool first_connect = false;  // Disabled to prevent forced reconnection on first disconnect
 
     if(!event) return ESP_OK;                                                       //Null would crash this function
 
