@@ -81,7 +81,7 @@ jobs:
 
   build-esp-idf-component:
     name: Build with ESP-IDF ${{ matrix.idf_ver }} for ${{ matrix.idf_target }}
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         # The version names here correspond to the versions of espressif/idf Docker image.
