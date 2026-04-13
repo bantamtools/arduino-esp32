@@ -1066,7 +1066,7 @@ esp_err_t WiFiGenericClass::_eventCallback(arduino_event_t *event)
         } else if(reason == WIFI_REASON_BEACON_TIMEOUT || reason == WIFI_REASON_HANDSHAKE_TIMEOUT) {
             WiFiSTAClass::_setStatus(WL_CONNECTION_LOST);
         } else if(reason == WIFI_REASON_AUTH_EXPIRE) {
-
+            WiFiSTAClass::_setStatus(WL_DISCONNECTED);
         } else {
             WiFiSTAClass::_setStatus(WL_DISCONNECTED);
         }
