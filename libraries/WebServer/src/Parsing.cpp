@@ -317,7 +317,10 @@ int WebServer::_uploadReadByte(WiFiClient& client){
     long timeoutIntervalMillis = client.getTimeout();
     boolean timedOut = false;
     for(;;) {
-      if (!client.connected()) return -1;
+      if (!client.connected()) {
+        Serial.printf("[MSG:INFO: [BTDIAG] _uploadReadByte: client NOT connected, returning -1\n");
+        return -1;
+      }
       // loosely modeled after blinkWithoutDelay pattern
       while(!timedOut && !client.available() && client.connected()){
         delay(2);
@@ -342,6 +345,7 @@ int WebServer::_uploadReadByte(WiFiClient& client){
 
       timedOut = millis() - startMillis >= timeoutIntervalMillis;
       if(timedOut) {
+        Serial.printf("[MSG:INFO: [BTDIAG] _uploadReadByte: TIMEOUT after %ld ms, res=%d\n", timeoutIntervalMillis, res);
         return res; // exit on a timeout
       }
     }
@@ -352,6 +356,7 @@ int WebServer::_uploadReadByte(WiFiClient& client){
 
 bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
   (void) len;
+  Serial.printf("[MSG:INFO: [BTDIAG] _parseForm ENTER boundary.len=%d content_len=%u\n", boundary.length(), len);
   log_v("Parse Form: Boundary: %s Length: %d", boundary.c_str(), len);
   String line;
   int retry = 0;
@@ -543,8 +548,10 @@ readfile:
       _postArgs=nullptr;
       _postArgsLen = 0;
     }
+    Serial.printf("[MSG:INFO: [BTDIAG] _parseForm return true (normal)\n");
     return true;
   }
+  Serial.printf("[MSG:INFO: [BTDIAG] _parseForm return false (error branch) line=%s\n", line.c_str());
   log_e("Error: line: %s", line.c_str());
   return false;
 }
@@ -581,6 +588,8 @@ String WebServer::urlDecode(const String& text)
 }
 
 bool WebServer::_parseFormUploadAborted(){
+  Serial.printf("[MSG:INFO: [BTDIAG] _parseFormUploadAborted ENTER total=%d curr=%d\n",
+             _currentUpload->totalSize, _currentUpload->currentSize);
   _currentUpload->status = UPLOAD_FILE_ABORTED;
   if(_currentHandler && _currentHandler->canUpload(_currentUri))
     _currentHandler->upload(*this, _currentUri, *_currentUpload);
