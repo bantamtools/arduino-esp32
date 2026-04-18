@@ -310,10 +310,15 @@ void WebServer::handleClient() {
     case HC_WAIT_READ:
       // Wait for data from client to become available
       if (_currentClient.available()) {
+        // [PR #9991 backport] Set the socket timeout BEFORE _parseRequest so that
+        // large multipart body ingest (_parseForm / _uploadReadByte) inherits
+        // HTTP_MAX_SEND_WAIT rather than the WiFiClient default. Previously the
+        // timeout was only applied after parsing completed, which meant slow-drain
+        // body reads would time out via the much shorter default and abort the
+        // connection. HTTP_MAX_SEND_WAIT is in milliseconds; our WiFiClient API
+        // takes seconds, so /1000 remains correct for this fork.
+        _currentClient.setTimeout(HTTP_MAX_SEND_WAIT / 1000);
         if (_parseRequest(_currentClient)) {
-          // because HTTP_MAX_SEND_WAIT is expressed in milliseconds,
-          // it must be divided by 1000
-          _currentClient.setTimeout(HTTP_MAX_SEND_WAIT / 1000);
           _contentLength = CONTENT_LENGTH_NOT_SET;
           _handleRequest();
 
