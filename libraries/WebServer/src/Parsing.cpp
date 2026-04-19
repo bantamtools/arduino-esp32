@@ -25,6 +25,7 @@
 #include "WiFiClient.h"
 #include "WebServer.h"
 #include "detail/mimetable.h"
+#include <esp_timer.h>  // [diag #475 t3] esp_timer_get_time
 
 #ifndef WEBSERVER_MAX_POST_ARGS
 #define WEBSERVER_MAX_POST_ARGS 32
@@ -40,6 +41,13 @@ const char * _http_method_str[] = {
 
 static const char Content_Type[] PROGMEM = "Content-Type";
 static const char filename[] PROGMEM = "filename";
+
+// [diag #475 t3] Three-timer upload profiler — accumulators updated
+// in _uploadReadByte's stall path. Linkage is deliberately non-static
+// so FluidNC's Web_Server::uploadEnd can read them via extern decl
+// and include them in the per-upload summary.
+int64_t diag475t3_t_wait_us = 0;
+uint32_t diag475t3_wait_events = 0;
 
 static char* readBytesWithTimeout(WiFiClient& client, size_t maxLength, size_t& dataLength, int timeout_ms)
 {
@@ -312,12 +320,15 @@ void WebServer::_uploadWriteByte(uint8_t b){
 int WebServer::_uploadReadByte(WiFiClient& client){
   int res = client.read();
   if(res < 0) {
+    // [diag #475 t3] time spent in stall-and-retry path
+    int64_t diag_wait_start = esp_timer_get_time();
+    diag475t3_wait_events++;
     // keep trying until you either read a valid byte or timeout
     unsigned long startMillis = millis();
     long timeoutIntervalMillis = client.getTimeout();
     boolean timedOut = false;
     for(;;) {
-      if (!client.connected()) return -1;
+      if (!client.connected()) { diag475t3_t_wait_us += esp_timer_get_time() - diag_wait_start; return -1; }
       // loosely modeled after blinkWithoutDelay pattern
       while(!timedOut && !client.available() && client.connected()){
         delay(2);
@@ -325,8 +336,7 @@ int WebServer::_uploadReadByte(WiFiClient& client){
       }
 
       res = client.read();
-      if(res >= 0) {
-        return res; // exit on a valid read
+      if(res >= 0) { diag475t3_t_wait_us += esp_timer_get_time() - diag_wait_start; return res; // exit on a valid read
       }
       // NOTE: it is possible to get here and have all of the following
       //       assertions hold true
@@ -341,8 +351,7 @@ int WebServer::_uploadReadByte(WiFiClient& client){
       //       issue
 
       timedOut = millis() - startMillis >= timeoutIntervalMillis;
-      if(timedOut) {
-        return res; // exit on a timeout
+      if(timedOut) { diag475t3_t_wait_us += esp_timer_get_time() - diag_wait_start; return res; // exit on a timeout
       }
     }
   }
