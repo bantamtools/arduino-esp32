@@ -54,6 +54,8 @@ uint32_t diag475t3_wait_events = 0;
 // quiet. Matching counter is reset per-upload from FluidNC's uploadStart.
 static const int64_t DIAG475T3_STALL_LOG_THRESHOLD_US = 500000;  // 500 ms
 int diag475t3_long_stall_count = 0;  // non-static: externally linked
+int64_t diag475t3_max_stall_us = 0;  // non-static: externally linked
+int diag475t3_max_loop_iters = 0;  // non-static: externally linked
 
 static char* readBytesWithTimeout(WiFiClient& client, size_t maxLength, size_t& dataLength, int timeout_ms)
 {
@@ -329,19 +331,24 @@ int WebServer::_uploadReadByte(WiFiClient& client){
     // [diag #475 t3] time spent in stall-and-retry path
     int64_t diag_wait_start = esp_timer_get_time();
     diag475t3_wait_events++;
+    int diag_loop_iters = 0;
     // keep trying until you either read a valid byte or timeout
     unsigned long startMillis = millis();
     long timeoutIntervalMillis = client.getTimeout();
     boolean timedOut = false;
     for(;;) {
+      diag_loop_iters++;
       if (!client.connected()) {
         int64_t diag_stall_dur_us = esp_timer_get_time() - diag_wait_start;
         diag475t3_t_wait_us += diag_stall_dur_us;
+        if (diag_stall_dur_us > diag475t3_max_stall_us) diag475t3_max_stall_us = diag_stall_dur_us;
+        if (diag_loop_iters > diag475t3_max_loop_iters) diag475t3_max_loop_iters = diag_loop_iters;
         if (diag_stall_dur_us >= DIAG475T3_STALL_LOG_THRESHOLD_US) {
           diag475t3_long_stall_count++;
-          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms]\n",
+          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms iters=%d]\n",
                  diag475t3_long_stall_count,
-                 (long long)(diag_stall_dur_us / 1000));
+                 (long long)(diag_stall_dur_us / 1000),
+                 diag_loop_iters);
         }
         return -1;
       }
@@ -355,11 +362,14 @@ int WebServer::_uploadReadByte(WiFiClient& client){
       if(res >= 0) {
         int64_t diag_stall_dur_us = esp_timer_get_time() - diag_wait_start;
         diag475t3_t_wait_us += diag_stall_dur_us;
+        if (diag_stall_dur_us > diag475t3_max_stall_us) diag475t3_max_stall_us = diag_stall_dur_us;
+        if (diag_loop_iters > diag475t3_max_loop_iters) diag475t3_max_loop_iters = diag_loop_iters;
         if (diag_stall_dur_us >= DIAG475T3_STALL_LOG_THRESHOLD_US) {
           diag475t3_long_stall_count++;
-          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms]\n",
+          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms iters=%d]\n",
                  diag475t3_long_stall_count,
-                 (long long)(diag_stall_dur_us / 1000));
+                 (long long)(diag_stall_dur_us / 1000),
+                 diag_loop_iters);
         }
         return res; // exit on a valid read
       }
@@ -379,11 +389,14 @@ int WebServer::_uploadReadByte(WiFiClient& client){
       if(timedOut) {
         int64_t diag_stall_dur_us = esp_timer_get_time() - diag_wait_start;
         diag475t3_t_wait_us += diag_stall_dur_us;
+        if (diag_stall_dur_us > diag475t3_max_stall_us) diag475t3_max_stall_us = diag_stall_dur_us;
+        if (diag_loop_iters > diag475t3_max_loop_iters) diag475t3_max_loop_iters = diag_loop_iters;
         if (diag_stall_dur_us >= DIAG475T3_STALL_LOG_THRESHOLD_US) {
           diag475t3_long_stall_count++;
-          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms]\n",
+          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms iters=%d]\n",
                  diag475t3_long_stall_count,
-                 (long long)(diag_stall_dur_us / 1000));
+                 (long long)(diag_stall_dur_us / 1000),
+                 diag_loop_iters);
         }
         return res; // exit on a timeout
       }
