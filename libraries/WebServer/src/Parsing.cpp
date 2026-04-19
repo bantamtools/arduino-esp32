@@ -309,46 +309,7 @@ void WebServer::_uploadWriteByte(uint8_t b){
   _currentUpload->buf[_currentUpload->currentSize++] = b;
 }
 
-// [TEST C — parser bulk read] Pushback buffer used by _uploadReadByte to
-// amortize the cost of one syscall per body byte. Sized to roughly two
-// MSS worth of data; sufficient to absorb a full receive burst.
-// Single-client framework, so a static buffer is safe; we reset it on
-// entry to _parseForm to avoid carrying stale bytes across requests.
-namespace {
-  constexpr size_t kBtdiagReadBufSize = 2048;
-  static uint8_t   _btdiag_read_buf[kBtdiagReadBufSize];
-  static size_t    _btdiag_read_pos = 0;
-  static size_t    _btdiag_read_len = 0;
-}
-
-void btdiag_reset_upload_buf() {
-  _btdiag_read_pos = 0;
-  _btdiag_read_len = 0;
-}
-
 int WebServer::_uploadReadByte(WiFiClient& client){
-  // Fast path: serve from pushback buffer.
-  if (_btdiag_read_pos < _btdiag_read_len) {
-    return _btdiag_read_buf[_btdiag_read_pos++];
-  }
-
-  // Buffer is empty. Try to bulk-refill if any bytes are immediately available.
-  _btdiag_read_pos = 0;
-  _btdiag_read_len = 0;
-  int avail = client.available();
-  if (avail > 0) {
-    size_t to_read = (size_t)avail;
-    if (to_read > kBtdiagReadBufSize) to_read = kBtdiagReadBufSize;
-    int got = client.read(_btdiag_read_buf, to_read);
-    if (got > 0) {
-      _btdiag_read_len = (size_t)got;
-      _btdiag_read_pos = 1;
-      return _btdiag_read_buf[0];
-    }
-    // got <= 0 — fall through to single-byte timeout retry.
-  }
-
-  // Single-byte slow path with timeout retry (original behavior preserved).
   int res = client.read();
   if(res < 0) {
     // keep trying until you either read a valid byte or timeout
@@ -389,13 +350,8 @@ int WebServer::_uploadReadByte(WiFiClient& client){
   return res;
 }
 
-extern void btdiag_reset_upload_buf();
-
 bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
   (void) len;
-  // [TEST C] Clear the static pushback buffer used by _uploadReadByte so
-  // any leftover bytes from a previous request are not served stale here.
-  btdiag_reset_upload_buf();
   log_v("Parse Form: Boundary: %s Length: %d", boundary.c_str(), len);
   String line;
   int retry = 0;
