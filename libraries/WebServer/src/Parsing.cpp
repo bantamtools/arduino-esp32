@@ -49,6 +49,12 @@ static const char filename[] PROGMEM = "filename";
 int64_t diag475t3_t_wait_us = 0;
 uint32_t diag475t3_wait_events = 0;
 
+// [diag #475 t3 long-stall] Individual stalls longer than this threshold
+// are logged with their duration. Adjust if 500 ms is too noisy or too
+// quiet. Matching counter is reset per-upload from FluidNC's uploadStart.
+static const int64_t DIAG475T3_STALL_LOG_THRESHOLD_US = 500000;  // 500 ms
+int diag475t3_long_stall_count = 0;  // non-static: externally linked
+
 static char* readBytesWithTimeout(WiFiClient& client, size_t maxLength, size_t& dataLength, int timeout_ms)
 {
   char *buf = nullptr;
@@ -328,7 +334,17 @@ int WebServer::_uploadReadByte(WiFiClient& client){
     long timeoutIntervalMillis = client.getTimeout();
     boolean timedOut = false;
     for(;;) {
-      if (!client.connected()) { diag475t3_t_wait_us += esp_timer_get_time() - diag_wait_start; return -1; }
+      if (!client.connected()) {
+        int64_t diag_stall_dur_us = esp_timer_get_time() - diag_wait_start;
+        diag475t3_t_wait_us += diag_stall_dur_us;
+        if (diag_stall_dur_us >= DIAG475T3_STALL_LOG_THRESHOLD_US) {
+          diag475t3_long_stall_count++;
+          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms]\n",
+                 diag475t3_long_stall_count,
+                 (long long)(diag_stall_dur_us / 1000));
+        }
+        return -1;
+      }
       // loosely modeled after blinkWithoutDelay pattern
       while(!timedOut && !client.available() && client.connected()){
         delay(2);
@@ -336,7 +352,16 @@ int WebServer::_uploadReadByte(WiFiClient& client){
       }
 
       res = client.read();
-      if(res >= 0) { diag475t3_t_wait_us += esp_timer_get_time() - diag_wait_start; return res; // exit on a valid read
+      if(res >= 0) {
+        int64_t diag_stall_dur_us = esp_timer_get_time() - diag_wait_start;
+        diag475t3_t_wait_us += diag_stall_dur_us;
+        if (diag_stall_dur_us >= DIAG475T3_STALL_LOG_THRESHOLD_US) {
+          diag475t3_long_stall_count++;
+          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms]\n",
+                 diag475t3_long_stall_count,
+                 (long long)(diag_stall_dur_us / 1000));
+        }
+        return res; // exit on a valid read
       }
       // NOTE: it is possible to get here and have all of the following
       //       assertions hold true
@@ -351,7 +376,16 @@ int WebServer::_uploadReadByte(WiFiClient& client){
       //       issue
 
       timedOut = millis() - startMillis >= timeoutIntervalMillis;
-      if(timedOut) { diag475t3_t_wait_us += esp_timer_get_time() - diag_wait_start; return res; // exit on a timeout
+      if(timedOut) {
+        int64_t diag_stall_dur_us = esp_timer_get_time() - diag_wait_start;
+        diag475t3_t_wait_us += diag_stall_dur_us;
+        if (diag_stall_dur_us >= DIAG475T3_STALL_LOG_THRESHOLD_US) {
+          diag475t3_long_stall_count++;
+          printf("[MSG:INFO: [diag475t3big] stall #%d dur=%lld ms]\n",
+                 diag475t3_long_stall_count,
+                 (long long)(diag_stall_dur_us / 1000));
+        }
+        return res; // exit on a timeout
       }
     }
   }
