@@ -312,12 +312,16 @@ void WebServer::handleClient() {
       if (_currentClient.available()) {
         // [PR #9991 backport] Set the socket timeout BEFORE _parseRequest so that
         // large multipart body ingest (_parseForm / _uploadReadByte) inherits
-        // HTTP_MAX_SEND_WAIT rather than the WiFiClient default. Previously the
-        // timeout was only applied after parsing completed, which meant slow-drain
-        // body reads would time out via the much shorter default and abort the
-        // connection. HTTP_MAX_SEND_WAIT is in milliseconds; our WiFiClient API
-        // takes seconds, so /1000 remains correct for this fork.
+        // HTTP_MAX_SEND_WAIT rather than the WiFiClient default.
         _currentClient.setTimeout(HTTP_MAX_SEND_WAIT / 1000);
+        // [Phase 2a] Bump the kernel TCP receive buffer on the accepted client
+        // socket. Default LwIP SO_RCVBUF on this build is ~5744 bytes (4 × MSS);
+        // that's only 4 TCP segments of slack before the window shrinks and the
+        // sender throttles. A larger RCVBUF gives the SD-write pipeline more
+        // time to drain without backpressuring the TCP layer. 16 KB is a cheap
+        // starting point; bump further if the diagnostic still shows aborts.
+        int rcvbuf = 16384;
+        _currentClient.setSocketOption(SO_RCVBUF, (char*)&rcvbuf, sizeof(rcvbuf));
         if (_parseRequest(_currentClient)) {
           _contentLength = CONTENT_LENGTH_NOT_SET;
           _handleRequest();
