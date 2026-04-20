@@ -317,7 +317,13 @@ int WebServer::_uploadReadByte(WiFiClient& client){
     long timeoutIntervalMillis = client.getTimeout();
     boolean timedOut = false;
     for(;;) {
-      if (!client.connected()) return -1;
+      if (!client.connected()) {
+        // [BTDIAG] distinguish peer-initiated abort (TCP RST/FIN) from a
+        // firmware-side timeout. These two are very different root causes
+        // for an UPLOAD_FILE_ABORTED. Ref #475.
+        Serial.printf("[MSG:INFO: [BTDIAG] _uploadReadByte abort: !client.connected() (peer closed)\n");
+        return -1;
+      }
       // loosely modeled after blinkWithoutDelay pattern
       while(!timedOut && !client.available() && client.connected()){
         delay(2);
@@ -342,6 +348,9 @@ int WebServer::_uploadReadByte(WiFiClient& client){
 
       timedOut = millis() - startMillis >= timeoutIntervalMillis;
       if(timedOut) {
+        // [BTDIAG] see comment above.
+        Serial.printf("[MSG:INFO: [BTDIAG] _uploadReadByte abort: timedOut (%ldms, res=%d)\n",
+                      timeoutIntervalMillis, res);
         return res; // exit on a timeout
       }
     }
