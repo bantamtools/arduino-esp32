@@ -23,6 +23,7 @@
 #include "esp_intr_alloc.h"
 #include "soc/periph_defs.h"
 #include "hal/usb_serial_jtag_ll.h"
+#include "HWCDCTxPolicy.h"
 
 ESP_EVENT_DEFINE_BASE(ARDUINO_HW_CDC_EVENTS);
 
@@ -31,6 +32,8 @@ static xQueueHandle rx_queue = NULL;
 static uint8_t rx_data_buf[64] = {0};
 static intr_handle_t intr_handle = NULL;
 static volatile bool initial_empty = false;
+// The last IN packet was a full 64 bytes, so the transfer still needs a ZLP (HWCDCTxPolicy.h).
+static volatile bool tx_last_full = false;
 static xSemaphoreHandle tx_lock = NULL;
 
 // workaround for when USB CDC is not connected
@@ -88,10 +91,13 @@ static void hw_cdc_isr_handler(void *arg) {
                 //ets_printf("CONNECTED\n");
                 arduino_hw_cdc_event_post(ARDUINO_HW_CDC_EVENTS, ARDUINO_HW_CDC_CONNECTED_EVENT, &event, sizeof(arduino_hw_cdc_event_data_t), &xTaskWoken);
             }
-            size_t queued_size;
+            size_t queued_size = 0;
             uint8_t *queued_buff = (uint8_t *)xRingbufferReceiveUpToFromISR(tx_ring_buf, &queued_size, 64);
+            bool last_full = tx_last_full;
+            hwcdc_tx_action_t action = hwcdc_tx_next(queued_buff != NULL, queued_size, &last_full);
+            tx_last_full = last_full;
             // If the hardware fifo is avaliable, write in it. Otherwise, do nothing.
-            if (queued_buff != NULL) {  //Although tx_queued_bytes may be larger than 0. We may have interrupt before xRingbufferSend() was called.
+            if (action == HWCDC_TX_SEND) {  //Although tx_queued_bytes may be larger than 0. We may have interrupt before xRingbufferSend() was called.
                 //Copy the queued buffer into the TX FIFO
                 usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY);
                 usb_serial_jtag_ll_write_txfifo(queued_buff, queued_size);
@@ -102,6 +108,12 @@ static void hw_cdc_isr_handler(void *arg) {
                 //ets_printf("TX:%u\n", queued_size);
                 event.tx.len = queued_size;
                 arduino_hw_cdc_event_post(ARDUINO_HW_CDC_EVENTS, ARDUINO_HW_CDC_TX_EVENT, &event, sizeof(arduino_hw_cdc_event_data_t), &xTaskWoken);
+            } else if (action == HWCDC_TX_ZLP) {
+                // The last packet was a full 64 bytes and the host has taken it. Flush the
+                // empty FIFO so the host ends the transfer; without it the reply waits on
+                // the host until the device sends something else. IN_EMPTY stays disabled:
+                // the next write() re-enables it and the still-latched status fires at once.
+                usb_serial_jtag_ll_txfifo_flush();
             }
         } else {
             usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY);
@@ -128,6 +140,7 @@ static void hw_cdc_isr_handler(void *arg) {
     if (usbjtag_intr_status & USB_SERIAL_JTAG_INTR_BUS_RESET) {
         usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_INTR_BUS_RESET);
         initial_empty = false;
+        tx_last_full = false;
         usb_serial_jtag_ll_ena_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY);
         //ets_printf("BUS_RESET\n");
         arduino_hw_cdc_event_post(ARDUINO_HW_CDC_EVENTS, ARDUINO_HW_CDC_BUS_RESET_EVENT, &event, sizeof(arduino_hw_cdc_event_data_t), &xTaskWoken);
@@ -187,6 +200,7 @@ void HWCDC::begin(unsigned long baud)
     }
     usb_serial_jtag_ll_disable_intr_mask(USB_SERIAL_JTAG_LL_INTR_MASK);
     usb_serial_jtag_ll_clr_intsts_mask(USB_SERIAL_JTAG_LL_INTR_MASK);
+    tx_last_full = false;
     usb_serial_jtag_ll_ena_intr_mask(USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY | USB_SERIAL_JTAG_INTR_SERIAL_OUT_RECV_PKT | USB_SERIAL_JTAG_INTR_BUS_RESET);
     if(!intr_handle && esp_intr_alloc(ETS_USB_SERIAL_JTAG_INTR_SOURCE, 0, hw_cdc_isr_handler, NULL, &intr_handle) != ESP_OK){
         isr_log_e("HW USB CDC failed to init interrupts");
@@ -202,6 +216,7 @@ void HWCDC::end()
     usb_serial_jtag_ll_disable_intr_mask(USB_SERIAL_JTAG_LL_INTR_MASK);
     esp_intr_free(intr_handle);
     intr_handle = NULL;
+    tx_last_full = false;
     if(tx_lock != NULL) {
         vSemaphoreDelete(tx_lock);
         tx_lock = NULL;
