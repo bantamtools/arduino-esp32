@@ -368,15 +368,23 @@ static bool _peerGone(WiFiClient& client){
 bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
   // Every way out of the parser that does not succeed frees the post-argument array
   // (about 1 KB); the success path frees it itself. Before, a failed or aborted
-  // multipart request left it allocated until the next multipart POST.
-  bool ok = _parseFormParts(client, boundary, len);
-  if (!ok) {
-    _clearPostArgs();
-  }
-  return ok;
+  // multipart request left it allocated until the next multipart POST. A scope guard,
+  // so an exception out of the parser or an upload callback (std::bad_alloc, which
+  // the caller may catch and survive) frees it too.
+  struct FreeUnlessOk {
+    WebServer* server;
+    bool ok;
+    ~FreeUnlessOk() {
+      if (!ok) {
+        server->_clearPostArgs();
+      }
+    }
+  } guard{this, false};
+  guard.ok = _parseFormParts(client, boundary, len);
+  return guard.ok;
 }
 
-bool WebServer::_parseFormParts(WiFiClient& client, String boundary, uint32_t len){
+bool WebServer::_parseFormParts(WiFiClient& client, const String& boundary, uint32_t len){
   (void) len;
   log_v("Parse Form: Boundary: %s Length: %d", boundary.c_str(), len);
   String line;
@@ -403,7 +411,7 @@ bool WebServer::_parseFormParts(WiFiClient& client, String boundary, uint32_t le
       line = client.readStringUntil('\r');
       client.readStringUntil('\n');
       bool isDisposition = line.length() > 19 && line.substring(0, 19).equalsIgnoreCase(F("Content-Disposition"));
-      if (mp_line_guard_give_up(&partGuard, line.length() == 0, isDisposition, _peerGone(client))) {
+      if (mp_line_guard_give_up(&partGuard, line.length() == 0, isDisposition, line.length() == 0 && _peerGone(client))) {
         log_e("Multipart part headers: no Content-Disposition, giving up");
         return false;
       }
@@ -441,7 +449,7 @@ bool WebServer::_parseFormParts(WiFiClient& client, String boundary, uint32_t le
               line = client.readStringUntil('\r');
               client.readStringUntil('\n');
               if (line.startsWith("--"+boundary)) break;
-              if (mp_line_guard_give_up(&valueGuard, line.length() == 0, false, _peerGone(client))) {
+              if (mp_line_guard_give_up(&valueGuard, line.length() == 0, false, line.length() == 0 && _peerGone(client))) {
                 log_e("Multipart field value: no boundary, giving up");
                 return false;
               }

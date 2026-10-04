@@ -8,7 +8,8 @@
 //   - a client that stops sending, closes, or sends junk in the part headers or in a
 //     field value makes the parser give up within a bounded simulated time, where the
 //     unpatched loops never return (a run past the hang limit counts as a failure);
-//   - every failed or aborted parse frees the post-argument array;
+//   - every failed or aborted parse frees the post-argument array, and so does an
+//     exception (std::bad_alloc) out of an upload callback;
 //   - the read timeout is HTTP_MAX_POST_WAIT outside a file body and
 //     HTTP_MAX_SEND_WAIT inside it.
 // Also checks the pure guard (detail/MultipartLineGuard.h) directly.
@@ -17,6 +18,7 @@
 #include "detail/MultipartLineGuard.h"
 
 #include <cstdio>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -75,6 +77,7 @@ struct Recorder : RequestHandler {
     std::string           file;  // bytes of the file being uploaded
     std::vector<std::string> files;
     unsigned long         timeout_at_start = 0, timeout_at_end = 0;
+    bool                  throw_on_write = false;  // an upload callback that runs out of memory
     bool canHandle(HTTPMethod, String) override { return true; }
     bool canUpload(String) override { return true; }
     void upload(WebServer&, String, HTTPUpload& up) override {
@@ -83,6 +86,7 @@ struct Recorder : RequestHandler {
             file.clear();
             timeout_at_start = g_client->getTimeout();
         } else if (up.status == UPLOAD_FILE_WRITE) {
+            if (throw_on_write) throw std::bad_alloc();
             file.append((const char*)up.buf, up.currentSize);
         } else if (up.status == UPLOAD_FILE_END) {  // the core repeats the last buffer here; not data
             timeout_at_end = g_client->getTimeout();
@@ -418,6 +422,29 @@ static void stale_post_args_freed_by_next_failure() {
     }
 }
 
+static void bad_alloc_from_upload_callback_frees_post_args() {
+    // FluidNC catches std::bad_alloc around handleClient and carries on, so an exception
+    // out of an upload callback must not leave the post-argument array (about 1 KB)
+    // allocated until the next multipart POST.
+    TestServer srv;
+    srv.rec.throw_on_write = true;
+    std::string body = part_field("path", "/") + part_file("file", "a.nc", gcode(3000)) + closing();
+    WiFiClient  c(request(body), FAKE_SILENT);
+    fake_millis        = 0;
+    fake_hang_limit_ms = 600000;
+    g_client           = &c;
+    c.setTimeout(HTTP_MAX_POST_WAIT / 1000);
+    bool threw = false;
+    try {
+        srv.parse(c);
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    g_client = nullptr;
+    CHECK(threw, "the callback's bad_alloc reaches the caller");
+    CHECK(srv.postArgsFreed(), "post args freed when an upload callback throws (leaked before)");
+}
+
 int main() {
     guard_cases();
     legit_fluidnc_v1();
@@ -436,6 +463,7 @@ int main() {
     too_many_fields();
     bad_first_boundary();
     stale_post_args_freed_by_next_failure();
+    bad_alloc_from_upload_callback_frees_post_args();
     if (failures) {
         std::printf("%d FAILED\n", failures);
         return 1;
