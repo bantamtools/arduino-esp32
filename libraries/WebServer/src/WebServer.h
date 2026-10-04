@@ -156,7 +156,9 @@ protected:
   void _parseArguments(String data);
   static String _responseCodeToString(int code);
   bool _parseForm(WiFiClient& client, String boundary, uint32_t len);
+  bool _parseFormParts(WiFiClient& client, String boundary, uint32_t len);
   bool _parseFormUploadAborted();
+  void _clearPostArgs();
   void _uploadWriteByte(uint8_t b);
   int _uploadReadByte(WiFiClient& client);
   void _prepareHeader(String& response, int code, const char* content_type, size_t contentLength);
