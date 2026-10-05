@@ -176,27 +176,28 @@ bool WebServer::_parseRequest(WiFiClient& client) {
 
     if (!isForm){
       size_t plainLength;
-      char* plainBuf = readBytesWithTimeout(client, _clientContentLength, plainLength, HTTP_MAX_POST_WAIT);
+      // Owned from here, so an exception out of _parseArguments (std::bad_alloc, which
+      // the caller may catch and survive) frees the body buffer too.
+      std::unique_ptr<char, void (*)(void*)> plainBuf(
+          readBytesWithTimeout(client, _clientContentLength, plainLength, HTTP_MAX_POST_WAIT), free);
       if (plainLength < _clientContentLength) {
-      	free(plainBuf);
       	return false;
       }
       if (_clientContentLength > 0) {
         if(isEncoded){
           //url encoded form
           if (searchStr != "") searchStr += '&';
-          searchStr += plainBuf;
+          searchStr += plainBuf.get();
         }
         _parseArguments(searchStr);
         if(!isEncoded){
           //plain post json or other data
           RequestArgument& arg = _currentArgs[_currentArgCount++];
           arg.key = F("plain");
-          arg.value = String(plainBuf);
+          arg.value = String(plainBuf.get());
         }
 
-        log_v("Plain: %s", plainBuf);
-        free(plainBuf);
+        log_v("Plain: %s", plainBuf.get());
       } else {
         // No content - but we can still have arguments in the URL.
         _parseArguments(searchStr);
@@ -255,24 +256,27 @@ void WebServer::_parseArguments(String data) {
   log_v("args: %s", data.c_str());
   if (_currentArgs)
     delete[] _currentArgs;
+  // Empty until the new array exists: a failed allocation (std::bad_alloc) must not
+  // leave a count that indexes a null array.
   _currentArgs = 0;
+  _currentArgCount = 0;
   if (data.length() == 0) {
-    _currentArgCount = 0;
     _currentArgs = new RequestArgument[1];
     return;
   }
-  _currentArgCount = 1;
+  int argCount = 1;
 
   for (int i = 0; i < (int)data.length(); ) {
     i = data.indexOf('&', i);
     if (i == -1)
       break;
     ++i;
-    ++_currentArgCount;
+    ++argCount;
   }
-  log_v("args count: %d", _currentArgCount);
+  log_v("args count: %d", argCount);
 
-  _currentArgs = new RequestArgument[_currentArgCount+1];
+  _currentArgs = new RequestArgument[argCount+1];
+  _currentArgCount = argCount;
   int pos = 0;
   int iarg;
   for (iarg = 0; iarg < _currentArgCount;) {
@@ -380,7 +384,22 @@ bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
       }
     }
   } guard{this, false};
-  guard.ok = _parseFormParts(client, boundary, len);
+  // Only this request's file part counts below. handleClient resets the upload after
+  // each request, but not when an exception unwinds through it.
+  _currentUpload.reset();
+  bool ok = _parseFormParts(client, boundary, len);
+  // Every unsuccessful exit tells the upload handler, once. The file-body exits already
+  // sent UPLOAD_FILE_ABORTED; the part-header, field-value and too-many-fields exits
+  // did not, and can come after a file part's UPLOAD_FILE_END. The request handler is
+  // not called for a failed parse, so without this a handler that keeps per-request
+  // upload state (FluidNC's /api/v2/files) never learns the request is over. Contract:
+  // UPLOAD_FILE_ABORTED may follow UPLOAD_FILE_END and means "this request failed, no
+  // request callback follows"; a handler whose file is already closed has nothing to
+  // delete and should only drop its state.
+  if (!ok && _currentUpload && _currentUpload->status != UPLOAD_FILE_ABORTED) {
+    _parseFormUploadAborted();
+  }
+  guard.ok = ok;
   return guard.ok;
 }
 
@@ -579,13 +598,18 @@ readfile:
       arg.key = _currentArgs[iarg].key;
       arg.value = _currentArgs[iarg].value;
     }
-    if (_currentArgs) delete[] _currentArgs;
-    _currentArgs = new RequestArgument[_postArgsLen];
+    // Build the merged array before giving up the old one: if the allocation throws
+    // (std::bad_alloc, which the caller may catch and survive), _currentArgs still owns
+    // a live array that the next _parseArguments frees once, not a freed one it would
+    // free again.
+    std::unique_ptr<RequestArgument[]> merged(new RequestArgument[_postArgsLen]);
     for (iarg = 0; iarg < _postArgsLen; iarg++){
-      RequestArgument& arg = _currentArgs[iarg];
+      RequestArgument& arg = merged[iarg];
       arg.key = _postArgs[iarg].key;
       arg.value = _postArgs[iarg].value;
     }
+    if (_currentArgs) delete[] _currentArgs;
+    _currentArgs = merged.release();
     _currentArgCount = iarg;
     _clearPostArgs();
     return true;

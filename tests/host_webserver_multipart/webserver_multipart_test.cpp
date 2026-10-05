@@ -11,16 +11,68 @@
 //   - every failed or aborted parse frees the post-argument array, and so does an
 //     exception (std::bad_alloc) out of an upload callback;
 //   - the read timeout is HTTP_MAX_POST_WAIT outside a file body and
-//     HTTP_MAX_SEND_WAIT inside it.
+//     HTTP_MAX_SEND_WAIT inside it;
+//   - a failed allocation (std::bad_alloc from operator new[], made to fail on demand
+//     below) leaves the argument arrays consistent, so the next request frees each
+//     array exactly once, and does not leak a plain POST body;
+//   - every unsuccessful multipart parse that started a file part ends with exactly one
+//     UPLOAD_FILE_ABORTED, also after the part's UPLOAD_FILE_END, so a handler that keeps
+//     per-request upload state (FluidNC's /api/v2/files) is reset for the next request.
 // Also checks the pure guard (detail/MultipartLineGuard.h) directly.
 
 #include "WebServer.h"
 #include "detail/MultipartLineGuard.h"
 
 #include <cstdio>
+#include <malloc/malloc.h>
 #include <new>
+#include <set>
 #include <string>
 #include <vector>
+
+// ---- operator new[] seam ------------------------------------------------------------
+// The WebServer argument arrays are the only array allocations here. Every live one is
+// tracked; delete[] of a pointer that is not live is counted as a double delete (and
+// not passed to free, so the run continues). fail_array_new_at = n makes the n-th
+// array allocation from now throw std::bad_alloc.
+static std::set<void*>& live_arrays() {
+    static std::set<void*>* s = new std::set<void*>();
+    return *s;
+}
+static int array_news        = 0;
+static int fail_array_new_at = 0;  // 0: never
+static int double_deletes    = 0;
+
+void* operator new[](size_t n) {
+    if (fail_array_new_at != 0 && ++array_news == fail_array_new_at) {
+        fail_array_new_at = 0;
+        throw std::bad_alloc();
+    }
+    void* p = malloc(n ? n : 1);
+    if (!p) throw std::bad_alloc();
+    live_arrays().insert(p);
+    return p;
+}
+void operator delete[](void* p) noexcept {
+    if (!p) return;
+    if (live_arrays().erase(p) == 0) {
+        ++double_deletes;
+        return;
+    }
+    free(p);
+}
+void operator delete[](void* p, size_t) noexcept { operator delete[](p); }
+
+static void fail_nth_array_new(int n) {
+    array_news        = 0;
+    fail_array_new_at = n;
+}
+
+static size_t heap_in_use() {
+    malloc_statistics_t st;
+    malloc_zone_statistics(nullptr, &st);
+    return st.size_in_use;
+}
 
 unsigned long fake_millis        = 0;
 unsigned long fake_hang_limit_ms = 0;
@@ -78,11 +130,23 @@ struct Recorder : RequestHandler {
     std::vector<std::string> files;
     unsigned long         timeout_at_start = 0, timeout_at_end = 0;
     bool                  throw_on_write = false;  // an upload callback that runs out of memory
+    // A model of FluidNC's /api/v2/files upload state (ApiV2.cpp uploadFiles): START
+    // with an upload already started is refused as a second file part; only ABORTED
+    // (or the request handler, which runs only after a successful parse) clears it.
+    bool                  v2_started  = false;
+    int                   v2_rejected = 0;
+    int count(int status) const {
+        int n = 0;
+        for (int s : statuses) n += s == status;
+        return n;
+    }
     bool canHandle(HTTPMethod, String) override { return true; }
     bool canUpload(String) override { return true; }
     void upload(WebServer&, String, HTTPUpload& up) override {
         statuses.push_back(up.status);
         if (up.status == UPLOAD_FILE_START) {
+            if (v2_started) ++v2_rejected;
+            v2_started = true;
             file.clear();
             timeout_at_start = g_client->getTimeout();
         } else if (up.status == UPLOAD_FILE_WRITE) {
@@ -91,6 +155,8 @@ struct Recorder : RequestHandler {
         } else if (up.status == UPLOAD_FILE_END) {  // the core repeats the last buffer here; not data
             timeout_at_end = g_client->getTimeout();
             files.push_back(file);
+        } else if (up.status == UPLOAD_FILE_ABORTED) {
+            v2_started = false;
         }
     }
 };
@@ -105,6 +171,15 @@ struct TestServer : WebServer {
     bool parse(WiFiClient& c) { return _parseRequest(c); }
     bool postArgsFreed() const { return _postArgs == nullptr && _postArgsLen == 0; }
     int  argCount() const { return _currentArgCount; }
+    // new T[n] of a type with a destructor returns the block plus an array cookie
+    // (16 bytes for RequestArgument here), so look for a block that starts up to 16
+    // bytes before the pointer.
+    bool currentArgsLive() const {
+        if (_currentArgs == nullptr) return true;
+        for (size_t off = 0; off <= 16; off += 8)
+            if (live_arrays().count((char*)_currentArgs - off) == 1) return true;
+        return false;
+    }
 };
 
 struct Outcome {
@@ -133,6 +208,15 @@ static std::string part_field(const std::string& name, const std::string& value)
 static std::string part_file(const std::string& name, const std::string& fname, const std::string& content) {
     return std::string("--") + BOUNDARY + "\r\nContent-Disposition: form-data; name=\"" + name + "\"; filename=\"" +
            fname + "\"\r\nContent-Type: application/octet-stream\r\n\r\n" + content + "\r\n";
+}
+
+static std::string plain_request(const std::string& body, const std::string& query = "") {
+    std::string r = "POST /api/v2/jobs" + query + " HTTP/1.1\r\n";
+    r += "Host: plotter\r\n";
+    r += "Content-Type: text/plain\r\n";
+    r += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+    r += "\r\n";
+    return r + body;
 }
 
 static std::string closing() { return std::string("--") + BOUNDARY + "--\r\n"; }
@@ -373,6 +457,7 @@ static void closed_mid_file_body() {
     Outcome    o = run(srv, c);
     CHECK(o.returned && !o.ok, "closed mid-body: parser fails");
     CHECK(!srv.rec.statuses.empty() && srv.rec.statuses.back() == UPLOAD_FILE_ABORTED, "handler told ABORTED");
+    CHECK(srv.rec.count(UPLOAD_FILE_ABORTED) == 1, "exactly once (%d)", srv.rec.count(UPLOAD_FILE_ABORTED));
     CHECK(o.postArgsFreed, "post args freed after an aborted body (leaked before)");
 }
 
@@ -445,6 +530,157 @@ static void bad_alloc_from_upload_callback_frees_post_args() {
     CHECK(srv.postArgsFreed(), "post args freed when an upload callback throws (leaked before)");
 }
 
+// Runs one parse expected to throw std::bad_alloc; true if it did.
+static bool run_expect_bad_alloc(TestServer& srv, WiFiClient& c) {
+    fake_millis        = 0;
+    fake_hang_limit_ms = 600000;
+    g_client           = &c;
+    c.setTimeout(HTTP_MAX_POST_WAIT / 1000);
+    bool threw = false;
+    try {
+        srv.parse(c);
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    fail_array_new_at = 0;
+    g_client          = nullptr;
+    return threw;
+}
+
+static void merged_args_allocation_failure_then_next_request() {
+    // _parseForm merges the post arguments into a new _currentArgs. Array allocations in
+    // this request: _parseArguments (1), the post arguments (2), the merged array (3).
+    TestServer srv;
+    int        before = double_deletes;
+    {
+        WiFiClient c(request(part_field("path", "/") + closing()), FAKE_SILENT);
+        fail_nth_array_new(3);
+        CHECK(run_expect_bad_alloc(srv, c), "the merged-array allocation failure reaches the caller");
+        CHECK(srv.postArgsFreed(), "post args freed");
+        CHECK(srv.currentArgsLive(), "_currentArgs is not left pointing at a freed array");
+    }
+    {
+        WiFiClient c(request(part_field("path", "/") + closing()), FAKE_SILENT);
+        Outcome    o = run(srv, c);
+        CHECK(o.returned && o.ok, "the next request parses");
+        CHECK(srv.arg("path") == "/", "and has its argument");
+    }
+    CHECK(double_deletes == before, "no array freed twice (%d)", double_deletes - before);
+}
+
+static void query_args_allocation_failure_leaves_no_count() {
+    // _parseArguments: a failed allocation must not leave a count over a null array.
+    TestServer srv;
+    WiFiClient c(request(part_field("path", "/") + closing(), "?a=1&b=2"), FAKE_SILENT);
+    fail_nth_array_new(1);
+    CHECK(run_expect_bad_alloc(srv, c), "the argument-array allocation failure reaches the caller");
+    CHECK(srv.argCount() == 0, "no argument count without an array (%d)", srv.argCount());
+    if (srv.argCount() == 0) {  // else hasArg would index a null array
+        CHECK(!srv.hasArg("a"), "and hasArg is safe");
+    }
+}
+
+static void plain_body_freed_when_args_allocation_fails() {
+    // A text/plain POST: the body buffer (malloc) is held while _parseArguments
+    // allocates. A failure there must not leak it.
+    TestServer  srv;
+    std::string body(100000, 'x');
+    size_t      before = heap_in_use();
+    {
+        WiFiClient c(plain_request(body), FAKE_SILENT);
+        fail_nth_array_new(1);
+        CHECK(run_expect_bad_alloc(srv, c), "the allocation failure reaches the caller");
+    }
+    size_t after = heap_in_use();
+    CHECK(after < before + body.size() / 2, "the 100 KB body is freed (heap grew by %zu bytes)",
+          after > before ? after - before : 0);
+}
+
+static void plain_body_still_parses() {
+    TestServer srv;
+    WiFiClient c(plain_request("{\"a\":1}", "?x=1"), FAKE_SILENT);
+    Outcome    o = run(srv, c);
+    CHECK(o.returned && o.ok, "a plain POST parses");
+    CHECK(srv.arg("plain") == "{\"a\":1}" && srv.arg("x") == "1", "with its body and query");
+}
+
+static void aborted_after_completed_file_part() {
+    // A file part completes (END), then the part headers never come.
+    TestServer  srv;
+    std::string body = part_file("file", "a.nc", gcode(100)) + std::string("--") + BOUNDARY + "\r\n";
+    WiFiClient  c(request(body), FAKE_SILENT);
+    Outcome     o = run(srv, c);
+    CHECK(o.returned && !o.ok, "fails");
+    CHECK(srv.rec.count(UPLOAD_FILE_END) == 1, "the file part ended");
+    CHECK(srv.rec.count(UPLOAD_FILE_ABORTED) == 1 && srv.rec.statuses.back() == UPLOAD_FILE_ABORTED,
+          "then exactly one ABORTED (%d)", srv.rec.count(UPLOAD_FILE_ABORTED));
+    CHECK(o.postArgsFreed, "post args freed");
+}
+
+static void aborted_after_file_then_stalled_field() {
+    TestServer  srv;
+    std::string body = part_file("file", "a.nc", gcode(100)) + std::string("--") + BOUNDARY +
+                       "\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/";
+    WiFiClient  c(request(body), FAKE_CLOSE);
+    Outcome     o = run(srv, c);
+    CHECK(o.returned && !o.ok, "fails");
+    CHECK(srv.rec.count(UPLOAD_FILE_ABORTED) == 1 && srv.rec.statuses.back() == UPLOAD_FILE_ABORTED,
+          "a field-value exit after a file part sends one ABORTED (%d)", srv.rec.count(UPLOAD_FILE_ABORTED));
+}
+
+static void aborted_after_file_then_too_many_fields() {
+    TestServer  srv;
+    std::string body = part_file("file", "a.nc", gcode(100));
+    for (int i = 0; i < 40; ++i) body += part_field("k" + std::to_string(i), "v");
+    body += closing();
+    WiFiClient c(request(body), FAKE_SILENT);
+    Outcome    o = run(srv, c);
+    CHECK(o.returned && !o.ok, "fails");
+    CHECK(srv.rec.count(UPLOAD_FILE_ABORTED) == 1 && srv.rec.statuses.back() == UPLOAD_FILE_ABORTED,
+          "the too-many-fields exit after a file part sends one ABORTED (%d)", srv.rec.count(UPLOAD_FILE_ABORTED));
+}
+
+static void failed_request_then_valid_upload_v2_model() {
+    // Codex F4: after a file part's END, a failed parse used to tell the handler nothing,
+    // so FluidNC's v2 upload state stayed "started" and the next valid upload was refused
+    // as a second file part.
+    TestServer srv;
+    {
+        std::string body = part_file("file", "a.nc", gcode(100)) + std::string("--") + BOUNDARY + "\r\n";
+        WiFiClient  c(request(body), FAKE_CLOSE);
+        Outcome     o = run(srv, c);
+        CHECK(o.returned && !o.ok, "the first request fails after its file part");
+    }
+    {
+        std::string content = gcode(500);
+        WiFiClient  c(request(part_file("file", "b.nc", content) + closing()), FAKE_SILENT);
+        Outcome     o = run(srv, c);
+        CHECK(o.returned && o.ok, "the next valid upload parses");
+        CHECK(srv.rec.v2_rejected == 0, "and is not refused as a second file part (%d)", srv.rec.v2_rejected);
+        CHECK(srv.rec.files.size() == 2 && srv.rec.files[1] == content, "its file is intact");
+    }
+}
+
+static void no_aborted_for_a_previous_requests_upload() {
+    // The upload object of an earlier request (still set when an exception skipped
+    // handleClient's reset; the harness never resets it) must not draw an ABORTED for a
+    // later request that has no file part.
+    TestServer srv;
+    {
+        WiFiClient c(request(part_file("file", "a.nc", gcode(100)) + closing()), FAKE_SILENT);
+        Outcome    o = run(srv, c);
+        CHECK(o.returned && o.ok, "a good upload");
+    }
+    size_t n = srv.rec.statuses.size();
+    {
+        WiFiClient c(request(head_only()), FAKE_CLOSE);
+        Outcome    o = run(srv, c);
+        CHECK(o.returned && !o.ok, "a later request with no file part fails");
+    }
+    CHECK(srv.rec.statuses.size() == n, "and the handler hears nothing about the earlier upload (%zu new)",
+          srv.rec.statuses.size() - n);
+}
+
 int main() {
     guard_cases();
     legit_fluidnc_v1();
@@ -464,6 +700,15 @@ int main() {
     bad_first_boundary();
     stale_post_args_freed_by_next_failure();
     bad_alloc_from_upload_callback_frees_post_args();
+    merged_args_allocation_failure_then_next_request();
+    query_args_allocation_failure_leaves_no_count();
+    plain_body_freed_when_args_allocation_fails();
+    plain_body_still_parses();
+    aborted_after_completed_file_part();
+    aborted_after_file_then_stalled_field();
+    aborted_after_file_then_too_many_fields();
+    failed_request_then_valid_upload_v2_model();
+    no_aborted_for_a_previous_requests_upload();
     if (failures) {
         std::printf("%d FAILED\n", failures);
         return 1;
