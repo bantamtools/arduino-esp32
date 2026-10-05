@@ -1,73 +1,76 @@
 // Host test for cores/esp32/HWCDCTxPolicy.h (no hardware, no test framework).
 //
-//   c++ -std=c++17 -Wall -Wextra -Werror -I../../cores/esp32 hwcdc_tx_policy_test.cpp -o /tmp/t && /tmp/t
+//   c++ -std=c++17 -O2 -Wall -Wextra -Werror -I../../cores/esp32 hwcdc_tx_policy_test.cpp -o /tmp/t && /tmp/t
 //
-// Exits 0 and prints "ALL PASS" when every check passes; prints each failure and exits 1
-// otherwise.
+// Exits 0 and prints "ALL PASS" when every check passes; prints the first failures and
+// exits 1 otherwise.
 
 #include "HWCDCTxPolicy.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 static int failures = 0;
-#define CHECK(cond, ...)                                       \
-    do {                                                       \
-        if (!(cond)) {                                         \
-            ++failures;                                        \
-            std::printf("FAIL %s:%d: %s: ", __FILE__, __LINE__, #cond); \
-            std::printf(__VA_ARGS__);                          \
-            std::printf("\n");                                 \
-        }                                                      \
+#define CHECK(cond, ...)                                                    \
+    do {                                                                    \
+        if (!(cond)) {                                                      \
+            if (++failures <= 20) {                                         \
+                std::printf("FAIL %s:%d: %s: ", __FILE__, __LINE__, #cond); \
+                std::printf(__VA_ARGS__);                                   \
+                std::printf("\n");                                          \
+            }                                                               \
+        }                                                                   \
     } while (0)
 
-// ---- Direct cases ----------------------------------------------------------------
+// The USB full-speed bulk max packet size, independent of the header under test.
+static const size_t kUsbMps = 64;
+
+// ---- No ZLP state ----------------------------------------------------------------
+//
+// The decision takes only "the ring returned bytes": no flag in, no flag out, so nothing
+// can carry a pending ZLP from one interrupt to the next. The enum has only SEND and IDLE.
+
+static_assert(std::is_same<decltype(&hwcdc_tx_next), hwcdc_tx_action_t (*)(bool)>::value,
+              "hwcdc_tx_next must be stateless: hwcdc_tx_action_t(bool)");
+static_assert(HWCDC_TX_SEND == 0 && HWCDC_TX_IDLE == 1, "only SEND and IDLE");
+static_assert(HWCDC_TX_PACKET_SIZE == kUsbMps, "the IN endpoint's max packet size is 64");
 
 static void direct_cases() {
-    bool lf = false;
-    CHECK(hwcdc_tx_next(true, 64, &lf) == HWCDC_TX_SEND, "full packet is sent");
-    CHECK(lf, "a 64-byte packet must be remembered as full");
-
-    lf = false;
-    CHECK(hwcdc_tx_next(true, 63, &lf) == HWCDC_TX_SEND, "short packet is sent");
-    CHECK(!lf, "a 63-byte packet is short: no ZLP owed");
-
-    lf = true;
-    CHECK(hwcdc_tx_next(true, 1, &lf) == HWCDC_TX_SEND, "data after a full packet is sent");
-    CHECK(!lf, "a short packet after a full one ends the transfer: no ZLP owed");
-
-    lf = true;
-    CHECK(hwcdc_tx_next(false, 0, &lf) == HWCDC_TX_ZLP, "empty ring after a full packet sends a ZLP");
-    CHECK(!lf, "the ZLP settles the debt");
-    CHECK(hwcdc_tx_next(false, 0, &lf) == HWCDC_TX_IDLE, "only one ZLP per full packet");
-
-    lf = false;
-    CHECK(hwcdc_tx_next(false, 0, &lf) == HWCDC_TX_IDLE, "empty ring after a short packet is idle");
-    CHECK(!lf, "idle leaves the flag clear");
+    CHECK(HWCDC_TX_MAX_PACKET < kUsbMps, "cap %d must be below the 64-byte max packet size", HWCDC_TX_MAX_PACKET);
+    CHECK(HWCDC_TX_MAX_PACKET == kUsbMps - 1, "cap %d should be 63 (largest short packet)", HWCDC_TX_MAX_PACKET);
+    CHECK(hwcdc_tx_next(true) == HWCDC_TX_SEND, "queued bytes are sent");
+    CHECK(hwcdc_tx_next(false) == HWCDC_TX_IDLE, "empty ring is idle");
 }
 
 // ---- Model: ring + ISR + host ----------------------------------------------------
 //
-// Byte ring like RINGBUF_TYPE_BYTEBUF: ReceiveUpTo returns at most 64 contiguous bytes
-// and stops at the wrap point. The FIFO holds one packet; the ISR runs when IN_EMPTY is
-// enabled and the host has taken the last packet, as the real ISR does. The host ends a
-// transfer (hands bytes to the application) only on a packet shorter than 64 bytes.
+// Byte ring like RINGBUF_TYPE_BYTEBUF: ReceiveUpTo returns at most the requested number
+// of contiguous bytes and stops at the wrap point. The ISR requests HWCDC_TX_MAX_PACKET,
+// as hw_cdc_isr_handler does, and runs when IN_EMPTY is enabled and the host has taken the
+// last packet. write() fills the ring and enables IN_EMPTY; when the ring is full it waits
+// for the ISR to drain, as the blocking xRingbufferSend does. The host ends a transfer
+// (hands bytes to the application) only on a packet shorter than 64 bytes.
 
 struct Model {
     std::vector<unsigned char> ring;
     size_t                     head = 0, count = 0;  // read position, bytes queued
     bool                       in_empty_ena = true;
-    bool                       last_full    = false;
-    std::string                host_partial;   // bytes in a transfer not yet ended
-    std::string                host_app;       // bytes the application has received
-    int                        zlps = 0;
+    std::string                host_partial;  // bytes in a transfer not yet ended
+    std::string                host_app;      // bytes the application has received
+    std::vector<size_t>        packets;       // size of every IN packet, in order
+    int                        empty_flushes = 0;
 
     explicit Model(size_t cap) : ring(cap) {}
 
-    void write(const std::string& s) {  // HWCDC::write: ring send, then enable IN_EMPTY
+    void write(const std::string& s) {
         for (char c : s) {
+            if (count == ring.size()) {  // ring full: the ISR drains while write() blocks
+                in_empty_ena = true;
+                isr();
+            }
             ring[(head + count) % ring.size()] = (unsigned char)c;
             ++count;
         }
@@ -83,13 +86,12 @@ struct Model {
         in_empty_ena = false;
         size_t n     = 0;
         if (count) {
-            n = count < 64 ? count : 64;
+            n = count < (size_t)HWCDC_TX_MAX_PACKET ? count : (size_t)HWCDC_TX_MAX_PACKET;
             if (head + n > ring.size()) {
                 n = ring.size() - head;  // contiguous only, like the byte ring
             }
         }
-        hwcdc_tx_action_t a = hwcdc_tx_next(n != 0, n, &last_full);
-        if (a == HWCDC_TX_SEND) {
+        if (hwcdc_tx_next(n != 0) == HWCDC_TX_SEND) {
             std::string pkt;
             for (size_t i = 0; i < n; ++i) {
                 pkt += (char)ring[(head + i) % ring.size()];
@@ -98,16 +100,17 @@ struct Model {
             count -= n;
             in_empty_ena = true;
             host_take(pkt);
-        } else if (a == HWCDC_TX_ZLP) {
-            ++zlps;
-            host_take(std::string());
         }
         return true;
     }
 
     void host_take(const std::string& pkt) {
+        packets.push_back(pkt.size());
+        if (pkt.empty()) {
+            ++empty_flushes;
+        }
         host_partial += pkt;
-        if (pkt.size() < HWCDC_TX_PACKET_SIZE) {  // short packet or ZLP ends the transfer
+        if (pkt.size() < kUsbMps) {  // short packet ends the transfer
             host_app += host_partial;
             host_partial.clear();
         }
@@ -118,66 +121,80 @@ struct Model {
     }
 };
 
-static std::string payload(size_t n, char seed) {
+static std::string payload(size_t n, size_t seed) {
     std::string s;
     for (size_t i = 0; i < n; ++i) {
         s += (char)('A' + (seed + i) % 26);
     }
-    s[n - 1] = '\n';
+    if (n) {
+        s[n - 1] = '\n';
+    }
     return s;
 }
 
-// Every reply written at idle must reach the application with no further traffic,
-// at every ring offset and for every length, including multiples of 64 (the 832-byte
-// $JobRec/Stats reply that stalled on the bench is 13 x 64).
-static void model_delivers_everything() {
-    const size_t cap = 2048;
-    for (size_t offset = 0; offset < 130; ++offset) {
-        for (size_t len : {1u, 63u, 64u, 65u, 127u, 128u, 129u, 832u, 1024u, 2048u - 64u}) {
+// Every burst of 0-1024 bytes, written at idle at every ring offset, reaches the
+// application with no further traffic: no packet is 64 bytes, the burst ends on a short
+// packet, nothing is held on the host, and no empty (ZLP) flush ever happens. The ring is
+// the HWCDC default of 256 bytes, so long bursts wrap and block in write().
+static void model_every_burst_every_offset() {
+    const size_t cap = 256;
+    for (size_t offset = 0; offset < cap; ++offset) {
+        for (size_t len = 0; len <= 1024; ++len) {
             Model m(cap);
-            if (offset) {  // advance the ring position with a short, delivered reply
+            if (offset) {  // advance the ring position with a delivered reply
                 m.write(payload(offset, 7));
                 m.run();
             }
             std::string before = m.host_app;
-            std::string reply  = payload(len, (char)len);
+            m.packets.clear();
+            std::string reply = payload(len, len);
             m.write(reply);
             m.run();
+            for (size_t p : m.packets) {
+                CHECK(p != kUsbMps && p <= (size_t)HWCDC_TX_MAX_PACKET, "offset %zu len %zu: %zu-byte packet", offset,
+                      len, p);
+            }
+            if (len) {
+                CHECK(!m.packets.empty() && m.packets.back() < kUsbMps,
+                      "offset %zu len %zu: burst does not end on a short packet", offset, len);
+            } else {
+                CHECK(m.packets.empty(), "offset %zu len 0: %zu packets sent", offset, m.packets.size());
+            }
             CHECK(m.host_app == before + reply, "offset %zu len %zu: host got %zu of %zu bytes", offset, len,
                   m.host_app.size() - before.size(), reply.size());
             CHECK(m.host_partial.empty(), "offset %zu len %zu: %zu bytes held on the host", offset, len,
                   m.host_partial.size());
+            CHECK(m.empty_flushes == 0, "offset %zu len %zu: %d ZLPs", offset, len, m.empty_flushes);
         }
     }
 }
 
-// The aligned 832-byte reply ends on a full packet and must take exactly one ZLP; a
-// reply ending on a short packet must take none.
-static void model_zlp_count() {
-    Model a(2048);
-    a.write(payload(832, 1));
-    a.run();
-    CHECK(a.zlps == 1, "aligned 832-byte reply: %d ZLPs, want 1", a.zlps);
-
-    Model b(2048);
-    b.write(payload(833, 1));
-    b.run();
-    CHECK(b.zlps == 0, "833-byte reply ends short: %d ZLPs, want 0", b.zlps);
-
-    // Back-to-back: reply, ok, reply, ok. Each idle point after a full packet gets one.
-    Model c(2048);
-    c.write(payload(64, 2));
-    c.run();
-    c.write(payload(64, 3));
-    c.run();
-    CHECK(c.zlps == 2, "two 64-byte replies at idle: %d ZLPs, want 2", c.zlps);
-    CHECK(c.host_app.size() == 128, "both delivered: got %zu", c.host_app.size());
+// The 64-byte line followed by a separate 2-byte CRLF write that stalled on the HW85:
+// both arrive, as two complete transfers, with no ZLP.
+static void model_line_then_crlf() {
+    for (size_t offset = 0; offset < 256; ++offset) {
+        Model m(256);
+        if (offset) {
+            m.write(payload(offset, 3));
+            m.run();
+        }
+        std::string before = m.host_app;
+        std::string line   = payload(64, 1);
+        line[63]           = 'x';
+        m.write(line);
+        m.run();
+        CHECK(m.host_app == before + line, "offset %zu: 64-byte line not delivered on its own", offset);
+        m.write("\r\n");
+        m.run();
+        CHECK(m.host_app == before + line + "\r\n", "offset %zu: CRLF after the 64-byte line not delivered", offset);
+        CHECK(m.empty_flushes == 0, "offset %zu: %d ZLPs", offset, m.empty_flushes);
+    }
 }
 
 int main() {
     direct_cases();
-    model_delivers_everything();
-    model_zlp_count();
+    model_every_burst_every_offset();
+    model_line_then_crlf();
     if (failures) {
         std::printf("%d FAILURE(S)\n", failures);
         return 1;
