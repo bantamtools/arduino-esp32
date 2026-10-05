@@ -25,6 +25,7 @@
 #include "WiFiClient.h"
 #include "WebServer.h"
 #include "detail/mimetable.h"
+#include "detail/MultipartLineGuard.h"
 
 #ifndef WEBSERVER_MAX_POST_ARGS
 #define WEBSERVER_MAX_POST_ARGS 32
@@ -175,27 +176,28 @@ bool WebServer::_parseRequest(WiFiClient& client) {
 
     if (!isForm){
       size_t plainLength;
-      char* plainBuf = readBytesWithTimeout(client, _clientContentLength, plainLength, HTTP_MAX_POST_WAIT);
+      // Owned from here, so an exception out of _parseArguments (std::bad_alloc, which
+      // the caller may catch and survive) frees the body buffer too.
+      std::unique_ptr<char, void (*)(void*)> plainBuf(
+          readBytesWithTimeout(client, _clientContentLength, plainLength, HTTP_MAX_POST_WAIT), free);
       if (plainLength < _clientContentLength) {
-      	free(plainBuf);
       	return false;
       }
       if (_clientContentLength > 0) {
         if(isEncoded){
           //url encoded form
           if (searchStr != "") searchStr += '&';
-          searchStr += plainBuf;
+          searchStr += plainBuf.get();
         }
         _parseArguments(searchStr);
         if(!isEncoded){
           //plain post json or other data
           RequestArgument& arg = _currentArgs[_currentArgCount++];
           arg.key = F("plain");
-          arg.value = String(plainBuf);
+          arg.value = String(plainBuf.get());
         }
 
-        log_v("Plain: %s", plainBuf);
-        free(plainBuf);
+        log_v("Plain: %s", plainBuf.get());
       } else {
         // No content - but we can still have arguments in the URL.
         _parseArguments(searchStr);
@@ -254,24 +256,27 @@ void WebServer::_parseArguments(String data) {
   log_v("args: %s", data.c_str());
   if (_currentArgs)
     delete[] _currentArgs;
+  // Empty until the new array exists: a failed allocation (std::bad_alloc) must not
+  // leave a count that indexes a null array.
   _currentArgs = 0;
+  _currentArgCount = 0;
   if (data.length() == 0) {
-    _currentArgCount = 0;
     _currentArgs = new RequestArgument[1];
     return;
   }
-  _currentArgCount = 1;
+  int argCount = 1;
 
   for (int i = 0; i < (int)data.length(); ) {
     i = data.indexOf('&', i);
     if (i == -1)
       break;
     ++i;
-    ++_currentArgCount;
+    ++argCount;
   }
-  log_v("args count: %d", _currentArgCount);
+  log_v("args count: %d", argCount);
 
-  _currentArgs = new RequestArgument[_currentArgCount+1];
+  _currentArgs = new RequestArgument[argCount+1];
+  _currentArgCount = argCount;
   int pos = 0;
   int iarg;
   for (iarg = 0; iarg < _currentArgCount;) {
@@ -350,7 +355,55 @@ int WebServer::_uploadReadByte(WiFiClient& client){
   return res;
 }
 
+void WebServer::_clearPostArgs(){
+  if (_postArgs) {
+    delete[] _postArgs;
+    _postArgs = nullptr;
+  }
+  _postArgsLen = 0;
+}
+
+// True when the client has closed (or reset) the connection and nothing is left to read:
+// an empty line read in that state is not a real empty line.
+static bool _peerGone(WiFiClient& client){
+  return !client.connected() && !client.available();
+}
+
 bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
+  // Every way out of the parser that does not succeed frees the post-argument array
+  // (about 1 KB); the success path frees it itself. Before, a failed or aborted
+  // multipart request left it allocated until the next multipart POST. A scope guard,
+  // so an exception out of the parser or an upload callback (std::bad_alloc, which
+  // the caller may catch and survive) frees it too.
+  struct FreeUnlessOk {
+    WebServer* server;
+    bool ok;
+    ~FreeUnlessOk() {
+      if (!ok) {
+        server->_clearPostArgs();
+      }
+    }
+  } guard{this, false};
+  // Only this request's file part counts below. handleClient resets the upload after
+  // each request, but not when an exception unwinds through it.
+  _currentUpload.reset();
+  bool ok = _parseFormParts(client, boundary, len);
+  // Every unsuccessful exit tells the upload handler, once. The file-body exits already
+  // sent UPLOAD_FILE_ABORTED; the part-header, field-value and too-many-fields exits
+  // did not, and can come after a file part's UPLOAD_FILE_END. The request handler is
+  // not called for a failed parse, so without this a handler that keeps per-request
+  // upload state (FluidNC's /api/v2/files) never learns the request is over. Contract:
+  // UPLOAD_FILE_ABORTED may follow UPLOAD_FILE_END and means "this request failed, no
+  // request callback follows"; a handler whose file is already closed has nothing to
+  // delete and should only drop its state.
+  if (!ok && _currentUpload && _currentUpload->status != UPLOAD_FILE_ABORTED) {
+    _parseFormUploadAborted();
+  }
+  guard.ok = ok;
+  return guard.ok;
+}
+
+bool WebServer::_parseFormParts(WiFiClient& client, const String& boundary, uint32_t len){
   (void) len;
   log_v("Parse Form: Boundary: %s Length: %d", boundary.c_str(), len);
   String line;
@@ -363,9 +416,10 @@ bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
   client.readStringUntil('\n');
   //start reading the form
   if (line == ("--"+boundary)){
-   if(_postArgs) delete[] _postArgs;
+    _clearPostArgs();
     _postArgs = new RequestArgument[WEBSERVER_MAX_POST_ARGS];
     _postArgsLen = 0;
+    mp_line_guard_t partGuard = mp_line_guard_make(true);
     while(1){
       String argName;
       String argValue;
@@ -375,7 +429,12 @@ bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
 
       line = client.readStringUntil('\r');
       client.readStringUntil('\n');
-      if (line.length() > 19 && line.substring(0, 19).equalsIgnoreCase(F("Content-Disposition"))){
+      bool isDisposition = line.length() > 19 && line.substring(0, 19).equalsIgnoreCase(F("Content-Disposition"));
+      if (mp_line_guard_give_up(&partGuard, line.length() == 0, isDisposition, line.length() == 0 && _peerGone(client))) {
+        log_e("Multipart part headers: no Content-Disposition, giving up");
+        return false;
+      }
+      if (isDisposition){
         int nameStart = line.indexOf('=');
         if (nameStart != -1){
           argName = line.substring(nameStart+2);
@@ -404,10 +463,15 @@ bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
           }
           log_v("PostArg Type: %s", argType.c_str());
           if (!argIsFile){
+            mp_line_guard_t valueGuard = mp_line_guard_make(false);
             while(1){
               line = client.readStringUntil('\r');
               client.readStringUntil('\n');
               if (line.startsWith("--"+boundary)) break;
+              if (mp_line_guard_give_up(&valueGuard, line.length() == 0, false, line.length() == 0 && _peerGone(client))) {
+                log_e("Multipart field value: no boundary, giving up");
+                return false;
+              }
               if (argValue.length() > 0) argValue += "\n";
               argValue += line;
             }
@@ -436,6 +500,9 @@ bool WebServer::_parseForm(WiFiClient& client, String boundary, uint32_t len){
             if(_currentHandler && _currentHandler->canUpload(_currentUri))
               _currentHandler->upload(*this, _currentUri, *_currentUpload);
             _currentUpload->status = UPLOAD_FILE_WRITE;
+            // The file body keeps the long per-read timeout (slow SD writes back up the
+            // TCP window; see the #9991 backport). Everything else uses HTTP_MAX_POST_WAIT.
+            client.setTimeout(HTTP_MAX_SEND_WAIT / 1000);
             int argByte = _uploadReadByte(client);
 readfile:
 
@@ -493,6 +560,7 @@ readfile:
                 _currentUpload->status = UPLOAD_FILE_END;
                 if(_currentHandler && _currentHandler->canUpload(_currentUri))
                   _currentHandler->upload(*this, _currentUri, *_currentUpload);
+                client.setTimeout(HTTP_MAX_POST_WAIT / 1000);
                 log_v("End File: %s Type: %s Size: %d", _currentUpload->filename.c_str(), _currentUpload->type.c_str(), _currentUpload->totalSize);
                 line = client.readStringUntil(0x0D);
                 client.readStringUntil(0x0A);
@@ -530,19 +598,20 @@ readfile:
       arg.key = _currentArgs[iarg].key;
       arg.value = _currentArgs[iarg].value;
     }
-    if (_currentArgs) delete[] _currentArgs;
-    _currentArgs = new RequestArgument[_postArgsLen];
+    // Build the merged array before giving up the old one: if the allocation throws
+    // (std::bad_alloc, which the caller may catch and survive), _currentArgs still owns
+    // a live array that the next _parseArguments frees once, not a freed one it would
+    // free again.
+    std::unique_ptr<RequestArgument[]> merged(new RequestArgument[_postArgsLen]);
     for (iarg = 0; iarg < _postArgsLen; iarg++){
-      RequestArgument& arg = _currentArgs[iarg];
+      RequestArgument& arg = merged[iarg];
       arg.key = _postArgs[iarg].key;
       arg.value = _postArgs[iarg].value;
     }
+    if (_currentArgs) delete[] _currentArgs;
+    _currentArgs = merged.release();
     _currentArgCount = iarg;
-    if (_postArgs) {
-      delete[] _postArgs;
-      _postArgs=nullptr;
-      _postArgsLen = 0;
-    }
+    _clearPostArgs();
     return true;
   }
   log_e("Error: line: %s", line.c_str());
@@ -584,5 +653,5 @@ bool WebServer::_parseFormUploadAborted(){
   _currentUpload->status = UPLOAD_FILE_ABORTED;
   if(_currentHandler && _currentHandler->canUpload(_currentUri))
     _currentHandler->upload(*this, _currentUri, *_currentUpload);
-  return false;
+  return false;  // _parseForm frees the post arguments, after the handler has seen them
 }

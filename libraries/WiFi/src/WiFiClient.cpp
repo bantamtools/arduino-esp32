@@ -188,7 +188,20 @@ WiFiClient::WiFiClient():_rxBuffer(nullptr),_connected(false),_timeout(WIFI_CLIE
 
 WiFiClient::WiFiClient(int fd):_connected(true),_timeout(WIFI_CLIENT_DEF_CONN_TIMEOUT_MS),next(NULL)
 {
-    clientSocketHandle.reset(new WiFiClientSocketHandle(fd));
+    // The client owns fd from here (WiFiServer::available has let go of it), but only the
+    // socket handle closes it. If the handle cannot be allocated (std::bad_alloc, which
+    // the caller may catch and survive), close fd here or nothing ever will. Past this
+    // point the handle closes it: shared_ptr::reset deletes the handle if its control
+    // block cannot be allocated, and a throw from the receive buffer destroys
+    // clientSocketHandle with the half-built client.
+    WiFiClientSocketHandle* handle;
+    try {
+        handle = new WiFiClientSocketHandle(fd);
+    } catch (...) {
+        close(fd);
+        throw;
+    }
+    clientSocketHandle.reset(handle);
     _rxBuffer.reset(new WiFiClientRxBuffer(fd));
 }
 

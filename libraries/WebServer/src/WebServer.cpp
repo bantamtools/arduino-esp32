@@ -317,8 +317,16 @@ void WebServer::handleClient() {
         // body reads would time out via the much shorter default and abort the
         // connection. HTTP_MAX_SEND_WAIT is in milliseconds; our WiFiClient API
         // takes seconds, so /1000 remains correct for this fork.
+        //
+        // The long timeout now covers only a multipart file body: _parseForm raises it
+        // around the body and drops it back afterwards. The request line, headers and
+        // multipart part headers use HTTP_MAX_POST_WAIT, so a client that goes quiet
+        // outside a file body costs seconds per read rather than 30 s. The reply is
+        // sent with HTTP_MAX_SEND_WAIT, as before.
+        _currentClient.setTimeout(HTTP_MAX_POST_WAIT / 1000);
+        bool parsed = _parseRequest(_currentClient);
         _currentClient.setTimeout(HTTP_MAX_SEND_WAIT / 1000);
-        if (_parseRequest(_currentClient)) {
+        if (parsed) {
           _contentLength = CONTENT_LENGTH_NOT_SET;
           _handleRequest();
 
