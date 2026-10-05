@@ -62,6 +62,12 @@ WiFiClient WiFiServer::available(){
       if(setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, (char*)&val, sizeof(int)) == ESP_OK)
         return WiFiClient(client_sock);
     }
+    // Not handed to a client, so close it here; it used to stay open for good.
+#ifdef ESP_IDF_VERSION_MAJOR
+    lwip_close(client_sock);
+#else
+    lwip_close_r(client_sock);
+#endif
   }
   return WiFiClient();
 }
