@@ -22,6 +22,10 @@
 // so a client that stopped sending (or a heap too low to build the line) kept the web
 // task inside the parser for good, holding the request's memory.
 //
+// Since readHttpLine (Parsing.cpp), a read that times out or hits a closed connection
+// fails the request directly and never reaches the guard. The guard still covers real
+// empty lines, junk lines, and a line emptied by a failed String allocation.
+//
 // The guard is told about each line the loop reads and says when to give up:
 //   - an empty line while the peer is gone (not connected, nothing buffered);
 //   - more than MP_GUARD_MAX_EMPTY_RUN empty lines in a row;

@@ -42,6 +42,44 @@ const char * _http_method_str[] = {
 static const char Content_Type[] PROGMEM = "Content-Type";
 static const char filename[] PROGMEM = "filename";
 
+// Reads one line into `line`: the text before the next '\r', then everything up to and
+// including the '\n' after it is dropped, exactly as readStringUntil('\r') followed by
+// readStringUntil('\n') did. Each byte waits up to the client's timeout, the same
+// timeout Stream::timedRead applies. Returns false when the line did not arrive whole:
+// a read timed out, or the peer closed, before its terminating "\r ... \n".
+//
+// Why not the readStringUntil pair: a timed-out read returns what it has, and nothing
+// marks it as cut short. An empty result reads as the blank line that ends the headers,
+// so a client that paused longer than the timeout between two header lines had the
+// rest of its headers taken as the body, and got a success reply for an upload that
+// was never stored. A pause inside a line split it in two, and the second read could
+// swallow the next real line. Every line read in the parser goes through here, and a
+// line that does not arrive whole fails the request.
+static bool readHttpLine(WiFiClient& client, String& line){
+  line = String();
+  const unsigned long timeout = client.getTimeout();
+  bool sawCR = false;
+  while (true) {
+    int c;
+    const unsigned long start = millis();
+    do {
+      c = client.read();
+    } while (c < 0 && millis() - start < timeout);
+    if (c < 0) {
+      return false;
+    }
+    if (!sawCR) {
+      if (c == '\r') {
+        sawCR = true;
+      } else {
+        line += (char)c;
+      }
+    } else if (c == '\n') {
+      return true;
+    }
+  }
+}
+
 static char* readBytesWithTimeout(WiFiClient& client, size_t maxLength, size_t& dataLength, int timeout_ms)
 {
   char *buf = nullptr;
@@ -76,8 +114,11 @@ static char* readBytesWithTimeout(WiFiClient& client, size_t maxLength, size_t& 
 
 bool WebServer::_parseRequest(WiFiClient& client) {
   // Read the first line of HTTP request
-  String req = client.readStringUntil('\r');
-  client.readStringUntil('\n');
+  String req;
+  if (!readHttpLine(client, req)) {
+    log_e("Request line timed out");
+    return false;
+  }
   //reset header value
   for (int i = 0; i < _headerKeysCount; ++i) {
     _currentHeaders[i].value =String();
@@ -140,8 +181,10 @@ bool WebServer::_parseRequest(WiFiClient& client) {
     bool isEncoded = false;
     //parse headers
     while(1){
-      req = client.readStringUntil('\r');
-      client.readStringUntil('\n');
+      if (!readHttpLine(client, req)) {
+        log_e("Request headers timed out");
+        return false;
+      }
       if (req == "") break;//no moar headers
       int headerDiv = req.indexOf(':');
       if (headerDiv == -1){
@@ -214,8 +257,10 @@ bool WebServer::_parseRequest(WiFiClient& client) {
     String headerValue;
     //parse headers
     while(1){
-      req = client.readStringUntil('\r');
-      client.readStringUntil('\n');
+      if (!readHttpLine(client, req)) {
+        log_e("Request headers timed out");
+        return false;
+      }
       if (req == "") break;//no moar headers
       int headerDiv = req.indexOf(':');
       if (headerDiv == -1){
@@ -409,11 +454,13 @@ bool WebServer::_parseFormParts(WiFiClient& client, const String& boundary, uint
   String line;
   int retry = 0;
   do {
-    line = client.readStringUntil('\r');
+    if (!readHttpLine(client, line)) {
+      log_e("Multipart first boundary timed out");
+      return false;
+    }
     ++retry;
   } while (line.length() == 0 && retry < 3);
 
-  client.readStringUntil('\n');
   //start reading the form
   if (line == ("--"+boundary)){
     _clearPostArgs();
@@ -427,8 +474,10 @@ bool WebServer::_parseFormParts(WiFiClient& client, const String& boundary, uint
       String argFilename;
       bool argIsFile = false;
 
-      line = client.readStringUntil('\r');
-      client.readStringUntil('\n');
+      if (!readHttpLine(client, line)) {
+        log_e("Multipart part headers timed out");
+        return false;
+      }
       bool isDisposition = line.length() > 19 && line.substring(0, 19).equalsIgnoreCase(F("Content-Disposition"));
       if (mp_line_guard_give_up(&partGuard, line.length() == 0, isDisposition, line.length() == 0 && _peerGone(client))) {
         log_e("Multipart part headers: no Content-Disposition, giving up");
@@ -453,20 +502,27 @@ bool WebServer::_parseFormParts(WiFiClient& client, const String& boundary, uint
           log_v("PostArg Name: %s", argName.c_str());
           using namespace mime;
           argType = FPSTR(mimeTable[txt].mimeType);
-          line = client.readStringUntil('\r');
-          client.readStringUntil('\n');
+          if (!readHttpLine(client, line)) {
+            log_e("Multipart part headers timed out");
+            return false;
+          }
           if (line.length() > 12 && line.substring(0, 12).equalsIgnoreCase(FPSTR(Content_Type))){
             argType = line.substring(line.indexOf(':')+2);
             //skip next line
-            client.readStringUntil('\r');
-            client.readStringUntil('\n');
+            String skipped;
+            if (!readHttpLine(client, skipped)) {
+              log_e("Multipart part headers timed out");
+              return false;
+            }
           }
           log_v("PostArg Type: %s", argType.c_str());
           if (!argIsFile){
             mp_line_guard_t valueGuard = mp_line_guard_make(false);
             while(1){
-              line = client.readStringUntil('\r');
-              client.readStringUntil('\n');
+              if (!readHttpLine(client, line)) {
+                log_e("Multipart field value timed out");
+                return false;
+              }
               if (line.startsWith("--"+boundary)) break;
               if (mp_line_guard_give_up(&valueGuard, line.length() == 0, false, line.length() == 0 && _peerGone(client))) {
                 log_e("Multipart field value: no boundary, giving up");
@@ -562,8 +618,10 @@ readfile:
                   _currentHandler->upload(*this, _currentUri, *_currentUpload);
                 client.setTimeout(HTTP_MAX_POST_WAIT / 1000);
                 log_v("End File: %s Type: %s Size: %d", _currentUpload->filename.c_str(), _currentUpload->type.c_str(), _currentUpload->totalSize);
-                line = client.readStringUntil(0x0D);
-                client.readStringUntil(0x0A);
+                if (!readHttpLine(client, line)) {
+                  log_e("Multipart: timed out after a file part");
+                  return false;
+                }
                 if (line == "--"){
                   log_v("Done Parsing POST");
                   break;
