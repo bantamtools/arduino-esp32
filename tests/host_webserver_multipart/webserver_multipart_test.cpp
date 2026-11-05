@@ -735,12 +735,14 @@ static void pauses_in_request_and_headers() {
     std::string content = gcode(3000);
     std::string r       = v1_upload_request(content);
     pause_case("mid request line", r, "POST /api/v2/fi");
+    pause_case("before the request line's CRLF", r, "HTTP/1.1");
     pause_case("between request headers", r, "Host: plotter\r\n");
     pause_case("inside a request header", r, "Content-Ty");
     pause_case("before the blank line ending the headers", r, "Content-Length: ");
     pause_case("before the first boundary", r, "\r\n\r\n");
     pause_case("inside a part's Content-Disposition", r, "filename=\"job.gc");
     pause_case("between a file part's headers", r, "filename=\"job.gcode\"\r\n");
+    pause_case("before the blank line after a part's Content-Type", r, "application/octet-stream\r\n");
     pause_case("inside a field value", r, "\r\n\r\n30");
     // After the file body: END has run, so a failure here is the ABORTED-after-END case.
     pause_case("after the file part's boundary", r, content + "\r\n--" + BOUNDARY, true);
