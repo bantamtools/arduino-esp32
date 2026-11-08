@@ -18,6 +18,9 @@
 //   - every unsuccessful multipart parse that started a file part ends with exactly one
 //     UPLOAD_FILE_ABORTED, also after the part's UPLOAD_FILE_END, so a handler that keeps
 //     per-request upload state (FluidNC's /api/v2/files) is reset for the next request.
+//   - a client that pauses and then carries on: a pause shorter than HTTP_MAX_POST_WAIT
+//     anywhere outside a file body is invisible, and a longer one fails the request
+//     instead of being parsed as an early end of the headers or a split line.
 // Also checks the pure guard (detail/MultipartLineGuard.h) directly.
 
 #include "WebServer.h"
@@ -391,8 +394,9 @@ static void stall_in_part_headers_silent() {
     Outcome    o = run(srv, c);
     CHECK(o.returned, "silent client in part headers: parser returns (elapsed %lu ms)", o.elapsed);
     CHECK(!o.ok, "and fails");
-    // Three empty lines, two 5 s reads each.
-    CHECK(o.elapsed <= 3 * 2 * HTTP_MAX_POST_WAIT + 100, "within 30 s (took %lu ms)", o.elapsed);
+    // The first part-header line times out once, and a line that does not arrive whole
+    // fails the request (readHttpLine).
+    CHECK(o.elapsed <= HTTP_MAX_POST_WAIT + 100, "within one 5 s timeout (took %lu ms)", o.elapsed);
     CHECK(o.postArgsFreed, "post args freed after the stall");
     CHECK(srv.rec.statuses.empty(), "no upload started");
 }
@@ -402,8 +406,8 @@ static void stall_in_part_headers_closed() {
     WiFiClient c(request(head_only()), FAKE_CLOSE);
     Outcome    o = run(srv, c);
     CHECK(o.returned && !o.ok, "closed client in part headers: parser fails (returned %d)", o.returned);
-    // One empty line (two reads) and the peer is gone.
-    CHECK(o.elapsed <= 2 * HTTP_MAX_POST_WAIT + 100, "within one empty line (took %lu ms)", o.elapsed);
+    // One timed-out line read.
+    CHECK(o.elapsed <= HTTP_MAX_POST_WAIT + 100, "within one 5 s timeout (took %lu ms)", o.elapsed);
     CHECK(o.postArgsFreed, "post args freed after the close");
 }
 
@@ -425,7 +429,7 @@ static void stall_in_field_value() {
     WiFiClient  c(request(body), FAKE_SILENT);
     Outcome     o = run(srv, c);
     CHECK(o.returned && !o.ok, "silent client in a field value: parser fails (returned %d)", o.returned);
-    CHECK(o.elapsed <= 4 * 2 * HTTP_MAX_POST_WAIT + 100, "bounded (took %lu ms)", o.elapsed);
+    CHECK(o.elapsed <= HTTP_MAX_POST_WAIT + 100, "within one 5 s timeout (took %lu ms)", o.elapsed);
     CHECK(o.postArgsFreed, "post args freed");
 }
 
@@ -435,7 +439,7 @@ static void closed_in_field_value() {
     WiFiClient  c(request(body), FAKE_CLOSE);
     Outcome     o = run(srv, c);
     CHECK(o.returned && !o.ok, "closed client in a field value: parser fails (returned %d)", o.returned);
-    CHECK(o.elapsed <= 2 * 2 * HTTP_MAX_POST_WAIT + 100, "bounded (took %lu ms)", o.elapsed);
+    CHECK(o.elapsed <= HTTP_MAX_POST_WAIT + 100, "within one 5 s timeout (took %lu ms)", o.elapsed);
 }
 
 static void stall_after_file_part() {
@@ -445,7 +449,7 @@ static void stall_after_file_part() {
     WiFiClient  c(request(body), FAKE_SILENT);
     Outcome     o = run(srv, c);
     CHECK(o.returned && !o.ok, "silent after a file part: parser fails (returned %d)", o.returned);
-    CHECK(o.elapsed <= 3 * 2 * HTTP_MAX_POST_WAIT + 100, "with the short timeout (took %lu ms)", o.elapsed);
+    CHECK(o.elapsed <= HTTP_MAX_POST_WAIT + 100, "within one short timeout (took %lu ms)", o.elapsed);
     CHECK(o.postArgsFreed, "post args freed");
 }
 
@@ -681,6 +685,95 @@ static void no_aborted_for_a_previous_requests_upload() {
           srv.rec.statuses.size() - n);
 }
 
+
+// ---- A client that pauses and then recovers ---------------------------------------
+// Outside a file body every read waits HTTP_MAX_POST_WAIT (5 s). A pause shorter than
+// that is invisible. A longer one must fail the request cleanly. Before readHttpLine,
+// a timed-out line read came back empty or cut short and was parsed as if it were
+// complete: a pause between two request headers ended the headers early, the multipart
+// body was read as a plain body, and the request "succeeded" with no upload, so the
+// handler replied 200 for a file that was never stored (seen on hardware with a 7 s pause).
+// A pause inside a part header turned the file part into a field.
+
+static const unsigned long SHORT_PAUSE = HTTP_MAX_POST_WAIT - 2000;  // 3 s: tolerated
+static const unsigned long LONG_PAUSE  = HTTP_MAX_POST_WAIT + 2000;  // 7 s: fails cleanly
+
+static std::string v1_upload_request(const std::string& content) {
+    return request(part_field("job.gcodeS", std::to_string(content.size())) +
+                   part_file("myfile[]", "job.gcode", content) + closing(), "?dontlist=yes");
+}
+
+static void pause_case(const char* where, const std::string& script, const std::string& marker, bool file_expected_on_failure = false) {
+    std::string content = gcode(3000);
+    for (unsigned long pause : {SHORT_PAUSE, LONG_PAUSE}) {
+        TestServer srv;
+        WiFiClient c(script, FAKE_SILENT);
+        c.pause_after(marker, pause);
+        Outcome o = run(srv, c);
+        if (pause == SHORT_PAUSE) {
+            CHECK(o.returned && o.ok, "%s, %lu ms pause: request still parses", where, pause);
+            CHECK(srv.rec.files.size() == 1 && srv.rec.files[0] == content, "%s, %lu ms pause: file intact (%zu files)",
+                  where, pause, srv.rec.files.size());
+        } else {
+            CHECK(o.returned && !o.ok, "%s, %lu ms pause: request fails instead of being misparsed (returned %d ok %d)",
+                  where, pause, o.returned, o.ok);
+            CHECK(o.elapsed <= LONG_PAUSE, "%s: fails at the timeout, not later (took %lu ms)", where, o.elapsed);
+            if (!file_expected_on_failure) {
+                CHECK(srv.rec.files.empty(), "%s: no file reported complete (%zu)", where, srv.rec.files.size());
+            }
+            if (srv.rec.count(UPLOAD_FILE_START) > 0) {
+                CHECK(srv.rec.count(UPLOAD_FILE_ABORTED) == 1 && srv.rec.statuses.back() == UPLOAD_FILE_ABORTED,
+                      "%s: the started upload ends with exactly one ABORTED (%d)", where,
+                      srv.rec.count(UPLOAD_FILE_ABORTED));
+            }
+            CHECK(o.postArgsFreed, "%s: post args freed", where);
+        }
+    }
+}
+
+static void pauses_in_request_and_headers() {
+    std::string content = gcode(3000);
+    std::string r       = v1_upload_request(content);
+    pause_case("mid request line", r, "POST /api/v2/fi");
+    pause_case("before the request line's CRLF", r, "HTTP/1.1");
+    pause_case("between request headers", r, "Host: plotter\r\n");
+    pause_case("inside a request header", r, "Content-Ty");
+    pause_case("before the blank line ending the headers", r, "Content-Length: ");
+    pause_case("before the first boundary", r, "\r\n\r\n");
+    pause_case("inside a part's Content-Disposition", r, "filename=\"job.gc");
+    pause_case("between a file part's headers", r, "filename=\"job.gcode\"\r\n");
+    pause_case("before the blank line after a part's Content-Type", r, "application/octet-stream\r\n");
+    pause_case("inside a field value", r, "\r\n\r\n30");
+    // After the file body: END has run, so a failure here is the ABORTED-after-END case.
+    pause_case("after the file part's boundary", r, content + "\r\n--" + BOUNDARY, true);
+}
+
+static void long_pause_in_get_headers_fails() {
+    // GET takes the other header loop.
+    for (unsigned long pause : {SHORT_PAUSE, LONG_PAUSE}) {
+        TestServer srv;
+        WiFiClient c("GET /upload?path=%2F HTTP/1.1\r\nHost: plotter\r\nX-A: 1\r\n\r\n", FAKE_SILENT);
+        c.pause_after("Host: plotter\r\n", pause);
+        Outcome o = run(srv, c);
+        CHECK(o.returned && o.ok == (pause == SHORT_PAUSE), "GET with a %lu ms header pause: ok=%d", pause, o.ok);
+    }
+}
+
+static void lone_cr_in_a_header_is_dropped_as_before() {
+    // readStringUntil('\r') + ('\n') dropped everything between a CR and the next LF;
+    // readHttpLine keeps that, so a header with a stray CR parses the same way.
+    TestServer  srv;
+    std::string content = gcode(500);
+    std::string body    = part_file("file", "a.nc", content) + closing();
+    std::string r       = "POST /api/v2/files HTTP/1.1\r\nHost: plotter\rjunk\r\n" +
+                    std::string("Content-Type: multipart/form-data; boundary=") + BOUNDARY + "\r\n" +
+                    "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+    WiFiClient c(r, FAKE_SILENT);
+    Outcome    o = run(srv, c);
+    CHECK(o.returned && o.ok, "stray CR in a header: still parses");
+    CHECK(srv.rec.files.size() == 1 && srv.rec.files[0] == content, "file intact");
+}
+
 int main() {
     guard_cases();
     legit_fluidnc_v1();
@@ -709,6 +802,9 @@ int main() {
     aborted_after_file_then_too_many_fields();
     failed_request_then_valid_upload_v2_model();
     no_aborted_for_a_previous_requests_upload();
+    pauses_in_request_and_headers();
+    long_pause_in_get_headers_fails();
+    lone_cr_in_a_header_is_dropped_as_before();
     if (failures) {
         std::printf("%d FAILED\n", failures);
         return 1;
