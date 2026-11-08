@@ -194,13 +194,20 @@ WiFiClient::WiFiClient(int fd):_connected(true),_timeout(WIFI_CLIENT_DEF_CONN_TI
     // point the handle closes it: shared_ptr::reset deletes the handle if its control
     // block cannot be allocated, and a throw from the receive buffer destroys
     // clientSocketHandle with the half-built client.
+    //
+    // The ESP-IDF component build compiles without -fexceptions, where new cannot throw
+    // (it aborts), so the guard is only needed and only compiled when exceptions are on.
     WiFiClientSocketHandle* handle;
+#if __cpp_exceptions
     try {
         handle = new WiFiClientSocketHandle(fd);
     } catch (...) {
         close(fd);
         throw;
     }
+#else
+    handle = new WiFiClientSocketHandle(fd);
+#endif
     clientSocketHandle.reset(handle);
     _rxBuffer.reset(new WiFiClientRxBuffer(fd));
 }
