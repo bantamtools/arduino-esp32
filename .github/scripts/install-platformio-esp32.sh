@@ -1,7 +1,9 @@
 #!/bin/bash
 
 export PLATFORMIO_ESP32_PATH="$HOME/.platformio/packages/framework-arduinoespressif32"
-PLATFORMIO_ESP32_URL="https://github.com/platformio/platform-espressif32.git"
+# Pinned: v8.0.0 (2026-10-19) dropped the toolchain-xtensa-esp32/-esp32s2 and toolchain-riscv32-esp
+# packages that the replace script below edits, so a floating install fails with KeyError.
+PLATFORMIO_ESP32_URL="https://github.com/platformio/platform-espressif32.git#v7.1.3"
 
 TOOLCHAIN_VERSION="8.4.0+2021r2-patch5"
 ESPTOOLPY_VERSION="~1.40400.0"
@@ -11,7 +13,7 @@ echo "Installing Python Wheel ..."
 pip install wheel > /dev/null 2>&1
 
 echo "Installing PlatformIO ..."
-pip install -U https://github.com/platformio/platformio/archive/master.zip > /dev/null 2>&1
+pip install -U "platformio==6.2.0" > /dev/null 2>&1
 
 echo "Installing Platform ESP32 ..."
 python -m platformio platform install $PLATFORMIO_ESP32_URL  > /dev/null 2>&1
